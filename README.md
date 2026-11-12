@@ -1,5 +1,4 @@
 # Python-Projects
-Python projects for fun
 
 1) Motion Detector Camera
   - captures mirrored video footage from webcam and displays it on screen
