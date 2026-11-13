@@ -1,8 +1,8 @@
-import base64
 import threading
 import tkinter as tk
 import cv2 as cv
 from motion_detection import PersonTracker
+from PIL import Image, ImageTk
 from values import EXTRA_HEIGHT, WINDOW_WIDTH
 
 class FrameProcessor(threading.Thread):
@@ -12,6 +12,7 @@ class FrameProcessor(threading.Thread):
         self.tracker = tracker
         self.lock = threading.Lock()
         self.latest_frame = None
+        self.latest_frame_id = 0
         self.error = None
         self.stopped = threading.Event()
 
@@ -26,6 +27,7 @@ class FrameProcessor(threading.Thread):
                 frame = self.tracker.detect(current)
                 with self.lock:
                     self.latest_frame = frame
+                    self.latest_frame_id += 1
         except Exception as error:
             with self.lock:
                 self.error = error
@@ -34,7 +36,7 @@ class FrameProcessor(threading.Thread):
 
     def latest(self):
         with self.lock:
-            return self.latest_frame, self.error
+            return self.latest_frame, self.latest_frame_id, self.error
 
     def stop(self):
         self.stopped.set()
@@ -44,6 +46,10 @@ def run():
     camera = cv.VideoCapture(0)
     if not camera.isOpened():
         raise RuntimeError('Could not open the camera.')
+
+    camera.set(cv.CAP_PROP_FRAME_WIDTH, 1280)
+    camera.set(cv.CAP_PROP_FRAME_HEIGHT, 720)
+    camera.set(cv.CAP_PROP_BUFFERSIZE, 1)
 
     processor = None
     try:
@@ -55,7 +61,9 @@ def run():
         root.title('Motion Tracking Camera')
         screen_width, screen_height = root.winfo_screenwidth(), root.winfo_screenheight()
         frame_height, frame_width = initial_frame.shape[:2]
-        window_height = int(WINDOW_WIDTH * frame_height / frame_width) + EXTRA_HEIGHT
+        window_height = (
+            int(WINDOW_WIDTH * frame_height / frame_width) + EXTRA_HEIGHT
+        )
         root.geometry(
             f'{WINDOW_WIDTH}x{window_height}+'
             f'{(screen_width - WINDOW_WIDTH) // 2}+'
@@ -66,12 +74,15 @@ def run():
         processor = FrameProcessor(camera, tracker)
         processor.start()
 
+        last_displayed_frame_id = 0
+
         def show_frame():
-            frame, error = processor.latest()
+            nonlocal last_displayed_frame_id
+            frame, frame_id, error = processor.latest()
             if error is not None:
                 root.destroy()
                 raise RuntimeError('Could not process the camera frame.') from error
-            if frame is None:
+            if frame is None or frame_id == last_displayed_frame_id:
                 root.after(15, show_frame)
                 return
             target_width, target_height = preview.winfo_width(), preview.winfo_height()
@@ -82,18 +93,17 @@ def run():
             height, width = frame.shape[:2]
             scale = max(target_width / width, target_height / height)
             width, height = int(width * scale), int(height * scale)
-            frame = cv.resize(frame, (width, height))
-            left, top = (width - target_width) // 2, (height - target_height) // 2
-            frame = frame[top : top + target_height, left : left + target_width]
 
-            ok, encoded = cv.imencode('.png', frame)
-            if not ok:
-                raise RuntimeError('Could not encode the camera frame.')
-            image = tk.PhotoImage(
-                data=base64.b64encode(encoded).decode('ascii'), format='png'
-            )
-            preview.configure(image=image)
-            preview.image = image
+            frame = cv.resize(frame, (width, height), interpolation=cv.INTER_AREA)
+            left = (width - target_width) // 2
+            top = (height - target_height) // 2
+            frame = frame[top:top + target_height, left:left + target_width]
+            frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+            photo = ImageTk.PhotoImage(Image.fromarray(frame))
+            preview.configure(image=photo)
+            preview.image = photo
+            last_displayed_frame_id = frame_id
+
             root.after(15, show_frame)
 
         def close(event=None):
