@@ -1,9 +1,11 @@
 import threading
 import tkinter as tk
+
 import cv2 as cv
 from motion_detection import PersonTracker
 from PIL import Image, ImageTk
 from values import EXTRA_HEIGHT, WINDOW_WIDTH
+
 
 class FrameProcessor(threading.Thread):
     def __init__(self, camera, tracker):
@@ -61,9 +63,7 @@ def run():
         root.title('Motion Tracking Camera')
         screen_width, screen_height = root.winfo_screenwidth(), root.winfo_screenheight()
         frame_height, frame_width = initial_frame.shape[:2]
-        window_height = (
-            int(WINDOW_WIDTH * frame_height / frame_width) + EXTRA_HEIGHT
-        )
+        window_height = int(WINDOW_WIDTH * frame_height / frame_width) + EXTRA_HEIGHT
         root.geometry(
             f'{WINDOW_WIDTH}x{window_height}+'
             f'{(screen_width - WINDOW_WIDTH) // 2}+'

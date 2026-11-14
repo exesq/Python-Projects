@@ -1,11 +1,12 @@
-import cv2 as cv
 import math
 import time
+from pathlib import Path
+
+import cv2 as cv
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from ultralytics import YOLO
-from pathlib import Path
 from values import (
     BOX_COLORS,
     BOX_THICKNESS,
@@ -19,13 +20,14 @@ from values import (
     PERSON_LABEL_PADDING,
     PERSON_LABEL_TEXT_COLOR,
     PERSON_LABEL_THICKNESS,
+    TRACK_COLOR_REUSE_IOU,
+    TRACK_STATE_MAX_AGE,
     YOLO_CONFIDENCE,
     YOLO_IMAGE_SIZE,
     YOLO_MIN_TRACK_HITS,
     YOLO_MODEL_FILE,
-    TRACK_COLOR_REUSE_IOU,
-    TRACK_STATE_MAX_AGE,
 )
+
 
 class PersonTracker:
     def __init__(self):
@@ -136,30 +138,22 @@ class PersonTracker:
                 self.heart_display_started = None
                 self.heart_position = None
             else:
-                overlay_size = min(
-                    HEART_OVERLAY_SIZE,
-                    frame.shape[1],
-                    frame.shape[0],
-                )
+                overlay_size = min(HEART_OVERLAY_SIZE, frame.shape[1], frame.shape[0])
                 heart = cv.resize(
-                    self.heart_image,
-                    (overlay_size, overlay_size),
+                    self.heart_image, (overlay_size, overlay_size),
                     interpolation=cv.INTER_AREA,
                 )
                 center_x, center_y = self.heart_position
                 x = max(
-                    0,
-                    min(center_x - overlay_size // 2, frame.shape[1] - overlay_size),
+                    0, min(center_x - overlay_size // 2, frame.shape[1] - overlay_size)
                 )
                 y = max(
-                    0,
-                    min(center_y - overlay_size // 2, frame.shape[0] - overlay_size),
+                    0, min(center_y - overlay_size // 2, frame.shape[0] - overlay_size)
                 )
                 alpha = min(
                     1.0,
                     (HEART_DISPLAY_DURATION - elapsed) / HEART_FADE_DURATION,
                 )
-                alpha = max(0.0, alpha)
                 region = annotated_frame[y:y + overlay_size, x:x + overlay_size]
                 cv.addWeighted(heart, alpha, region, 1 - alpha, 0, region)
 
@@ -175,13 +169,9 @@ class PersonTracker:
                 fallback_index = fallback_indices.get(class_id, 0)
                 fallback_indices[class_id] = fallback_index + 1
                 track_id = (
-                    int(box.id[0].item())
-                    if box.id is not None
-                    else fallback_index
+                    int(box.id[0].item()) if box.id is not None else fallback_index
                 )
-                detections.append(
-                    ((class_id, track_id), class_id, (x1, y1, x2, y2))
-                )
+                detections.append(((class_id, track_id), class_id, (x1, y1, x2, y2)))
 
         current_keys = {detection[0] for detection in detections}
         self.track_states = {
@@ -195,47 +185,38 @@ class PersonTracker:
         for color_key, class_id, bounds in detections:
             state = self.track_states.get(color_key)
             if state is None:
-                match = None
-                match_iou = TRACK_COLOR_REUSE_IOU
-                for previous_key, previous_state in self.track_states.items():
-                    if (
-                        previous_key in current_keys
-                        or previous_key in matched_previous_keys
-                        or previous_key[0] != class_id
-                    ):
-                        continue
-                    overlap = self.box_iou(bounds, previous_state[0])
-                    if overlap > match_iou:
-                        match = (previous_key, previous_state)
-                        match_iou = overlap
-
-                if match is None:
+                match = max(
+                    (
+                        (self.box_iou(bounds, previous[0]), key, previous)
+                        for key, previous in self.track_states.items()
+                        if key not in current_keys
+                        and key not in matched_previous_keys
+                        and key[0] == class_id
+                    ),
+                    key=lambda item: item[0],
+                    default=None,
+                )
+                if match is not None and match[0] > TRACK_COLOR_REUSE_IOU:
+                    _, previous_key, state = match
+                    matched_previous_keys.add(previous_key)
+                    self.colors[color_key] = state[1]
+                    del self.track_states[previous_key]
+                else:
                     color = self.colors.setdefault(
                         color_key,
                         BOX_COLORS[len(self.colors) % len(BOX_COLORS)],
                     )
-                    hits = 1
-                    confirmed = False
-                else:
-                    previous_key, state = match
-                    matched_previous_keys.add(previous_key)
-                    _, color, last_seen, previous_hits, was_confirmed = state
-                    hits = previous_hits + 1 if last_seen == self.frame_number - 1 else 1
-                    confirmed = was_confirmed and last_seen == self.frame_number - 1
-                    self.colors[color_key] = color
-                    del self.track_states[previous_key]
-            else:
-                _, color, last_seen, previous_hits, was_confirmed = state
-                hits = previous_hits + 1 if last_seen == self.frame_number - 1 else 1
-                confirmed = was_confirmed and last_seen == self.frame_number - 1
+                    state = bounds, color, self.frame_number - 1, 0, False
 
-            confirmed = confirmed or hits >= YOLO_MIN_TRACK_HITS
+            _, color, last_seen, previous_hits, was_confirmed = state
+            consecutive = last_seen == self.frame_number - 1
+            hits = previous_hits + 1 if consecutive else 1
+            confirmed = (
+                was_confirmed and consecutive
+                or hits >= YOLO_MIN_TRACK_HITS
+            )
             self.track_states[color_key] = (
-                bounds,
-                color,
-                self.frame_number,
-                hits,
-                confirmed,
+                bounds, color, self.frame_number, hits, confirmed
             )
             if confirmed:
                 visible_detections.append((class_id, bounds, color))
@@ -250,38 +231,34 @@ class PersonTracker:
             )
 
             if class_id == 0:
-                label = PERSON_LABEL
                 font = cv.FONT_HERSHEY_SIMPLEX
-                font_scale = PERSON_LABEL_FONT_SCALE
-                thickness = PERSON_LABEL_THICKNESS
-                padding = PERSON_LABEL_PADDING
-
                 (text_width, text_height), baseline = cv.getTextSize(
-                    label, font, font_scale, thickness
+                    PERSON_LABEL, font, PERSON_LABEL_FONT_SCALE, PERSON_LABEL_THICKNESS
                 )
-                label_width = text_width + padding * 2
-                label_height = text_height + baseline + padding * 2
+                label_width = text_width + PERSON_LABEL_PADDING * 2
+                label_height = text_height + baseline + PERSON_LABEL_PADDING * 2
                 frame_width = annotated_frame.shape[1]
-                label_x = max(
-                    0,
-                    min(x1, frame_width - label_width),
-                )
+                label_x = max(0, min(x1, frame_width - label_width))
                 label_y = max(0, y1 - label_height)
 
                 cv.rectangle(
                     annotated_frame,
                     (label_x, label_y),
                     (label_x + label_width, label_y + label_height),
-                    color, -1,
+                    color,
+                    -1,
                 )
                 cv.putText(
                     annotated_frame,
-                    label,
-                    (label_x + padding, label_y + padding + text_height),
+                    PERSON_LABEL,
+                    (
+                        label_x + PERSON_LABEL_PADDING,
+                        label_y + PERSON_LABEL_PADDING + text_height,
+                    ),
                     font,
-                    font_scale,
+                    PERSON_LABEL_FONT_SCALE,
                     PERSON_LABEL_TEXT_COLOR,
-                    thickness,
+                    PERSON_LABEL_THICKNESS,
                     cv.LINE_AA,
                 )
         return annotated_frame
