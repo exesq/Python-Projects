@@ -1,11 +1,9 @@
 import threading
 import tkinter as tk
-
 import cv2 as cv
 from motion_detection import PersonTracker
 from PIL import Image, ImageTk
 from values import EXTRA_HEIGHT, WINDOW_WIDTH
-
 
 class FrameProcessor(threading.Thread):
     def __init__(self, camera, tracker):

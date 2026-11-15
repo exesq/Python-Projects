@@ -1,7 +1,6 @@
 import math
 import time
 from pathlib import Path
-
 import cv2 as cv
 import mediapipe as mp
 from mediapipe.tasks import python
@@ -15,6 +14,8 @@ from values import (
     HEART_FADE_DURATION,
     HEART_IMAGE_FILE,
     HEART_OVERLAY_SIZE,
+    MAX_GESTURE_PEOPLE,
+    PEACE_IMAGE_FILE,
     PERSON_LABEL,
     PERSON_LABEL_FONT_SCALE,
     PERSON_LABEL_PADDING,
@@ -28,7 +29,6 @@ from values import (
     YOLO_MODEL_FILE,
 )
 
-
 class PersonTracker:
     def __init__(self):
         hand = Path(__file__).with_name(HAND_LANDMARKER_MODEL_FILE)
@@ -40,21 +40,26 @@ class PersonTracker:
         options = vision.HandLandmarkerOptions(
             base_options=python.BaseOptions(model_asset_path=str(hand)),
             running_mode=vision.RunningMode.VIDEO,
-            num_hands=2,
+            num_hands=MAX_GESTURE_PEOPLE * 2,
         )
         self.hand_detector = vision.HandLandmarker.create_from_options(options)
         self.colors = {}
         self.track_states = {}
         self.frame_number = 0
-        self.heart_gesture_active = False
-        self.heart_display_started = None
-        self.heart_position = None
+        self.gesture_states = {}
 
-        image = Path(__file__).parent / 'images' / HEART_IMAGE_FILE
-        self.heart_image = cv.imread(str(image), cv.IMREAD_COLOR)
+        images = Path(__file__).parent / 'images'
+        heart_image = images / HEART_IMAGE_FILE
+        self.heart_image = cv.imread(str(heart_image), cv.IMREAD_COLOR)
 
         if self.heart_image is None:
-            raise FileNotFoundError(f'Could not load heart image: {image}')
+            raise FileNotFoundError(f'Could not load heart image: {heart_image}')
+
+        peace_image = images / PEACE_IMAGE_FILE
+        self.peace_image = cv.imread(str(peace_image), cv.IMREAD_COLOR)
+
+        if self.peace_image is None:
+            raise FileNotFoundError(f'Could not load peace image: {peace_image}')
 
     @staticmethod
     def heart_gesture(hands):
@@ -82,6 +87,39 @@ class PersonTracker:
         )
 
     @staticmethod
+    def peace_gesture(hand):
+        if len(hand) < 21:
+            return False
+
+        return (
+            hand[12].y < hand[10].y
+            and hand[8].y < hand[6].y
+            and hand[16].y > hand[14].y
+            and hand[20].y > hand[18].y
+        )
+
+    @staticmethod
+    def _draw_gesture_overlay(frame, image, position, display_started):
+        if display_started is None or position is None:
+            return display_started
+
+        elapsed = time.monotonic() - display_started
+        if elapsed >= HEART_DISPLAY_DURATION:
+            return None
+
+        overlay_size = min(HEART_OVERLAY_SIZE, frame.shape[1], frame.shape[0])
+        overlay = cv.resize(
+            image, (overlay_size, overlay_size), interpolation=cv.INTER_AREA
+        )
+        center_x, center_y = position
+        x = max(0, min(center_x - overlay_size // 2, frame.shape[1] - overlay_size))
+        y = max(0, min(center_y - overlay_size // 2, frame.shape[0] - overlay_size))
+        alpha = min(1.0, (HEART_DISPLAY_DURATION - elapsed) / HEART_FADE_DURATION)
+        region = frame[y:y + overlay_size, x:x + overlay_size]
+        cv.addWeighted(overlay, alpha, region, 1 - alpha, 0, region)
+        return display_started
+
+    @staticmethod
     def box_iou(first, second):
         x1 = max(first[0], second[0])
         y1 = max(first[1], second[1])
@@ -101,64 +139,9 @@ class PersonTracker:
             conf=YOLO_CONFIDENCE,
             verbose=False,
         )
-        annotated_frame = frame.copy()
-        self.frame_number += 1
-
-        rgb_frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-        mp_frame = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-        timestamp_ms = time.monotonic_ns() // 1_000_000
-        hand_result = self.hand_detector.detect_for_video(mp_frame, timestamp_ms)
-
-        gesture_detected = self.heart_gesture(hand_result.hand_landmarks)
-        if gesture_detected:
-            left, right = sorted(
-                hand_result.hand_landmarks[:2],
-                key=lambda hand: hand[0].x,
-            )
-            frame_height, frame_width = frame.shape[:2]
-            self.heart_position = (
-                int(
-                    (left[4].x + right[4].x + left[8].x + right[8].x)
-                    * frame_width
-                    / 4
-                ),
-                int(
-                    (left[4].y + right[4].y + left[8].y + right[8].y)
-                    * frame_height
-                    / 4
-                ),
-            )
-            if not self.heart_gesture_active:
-                self.heart_display_started = time.monotonic()
-        self.heart_gesture_active = gesture_detected
-
-        if self.heart_display_started is not None and self.heart_position is not None:
-            elapsed = time.monotonic() - self.heart_display_started
-            if elapsed >= HEART_DISPLAY_DURATION:
-                self.heart_display_started = None
-                self.heart_position = None
-            else:
-                overlay_size = min(HEART_OVERLAY_SIZE, frame.shape[1], frame.shape[0])
-                heart = cv.resize(
-                    self.heart_image, (overlay_size, overlay_size),
-                    interpolation=cv.INTER_AREA,
-                )
-                center_x, center_y = self.heart_position
-                x = max(
-                    0, min(center_x - overlay_size // 2, frame.shape[1] - overlay_size)
-                )
-                y = max(
-                    0, min(center_y - overlay_size // 2, frame.shape[0] - overlay_size)
-                )
-                alpha = min(
-                    1.0,
-                    (HEART_DISPLAY_DURATION - elapsed) / HEART_FADE_DURATION,
-                )
-                region = annotated_frame[y:y + overlay_size, x:x + overlay_size]
-                cv.addWeighted(heart, alpha, region, 1 - alpha, 0, region)
-
         detections = []
         fallback_indices = {}
+        person_candidates = []
         for result in results:
             if result.boxes is None:
                 continue
@@ -171,7 +154,115 @@ class PersonTracker:
                 track_id = (
                     int(box.id[0].item()) if box.id is not None else fallback_index
                 )
-                detections.append(((class_id, track_id), class_id, (x1, y1, x2, y2)))
+                color_key = class_id, track_id
+                bounds = x1, y1, x2, y2
+                detections.append((color_key, class_id, bounds))
+                if class_id == 0:
+                    person_candidates.append(
+                        (float(box.conf[0].item()), color_key, bounds)
+                    )
+
+        person_candidates.sort(key=lambda person: person[0], reverse=True)
+        people = person_candidates[:MAX_GESTURE_PEOPLE]
+        annotated_frame = frame.copy()
+        self.frame_number += 1
+
+        rgb_frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+        mp_frame = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        timestamp_ms = time.monotonic_ns() // 1_000_000
+        hand_result = self.hand_detector.detect_for_video(mp_frame, timestamp_ms)
+
+        hands = hand_result.hand_landmarks
+        frame_height, frame_width = frame.shape[:2]
+        hands_by_person = {person[1]: [] for person in people}
+        for hand in hands:
+            if len(hand) < 21:
+                continue
+
+            palm_x = (hand[0].x + hand[9].x) * frame_width / 2
+            palm_y = (hand[0].y + hand[9].y) * frame_height / 2
+            matches = []
+            for _, person_key, (x1, y1, x2, y2) in people:
+                if x1 <= palm_x <= x2 and y1 <= palm_y <= y2:
+                    area = (x2 - x1) * (y2 - y1)
+                    matches.append((area, person_key))
+            if matches:
+                _, person_key = min(matches)
+                hands_by_person[person_key].append(hand)
+
+        current_person_keys = set(hands_by_person)
+        self.gesture_states = {
+            key: state
+            for key, state in self.gesture_states.items()
+            if key[0] in current_person_keys
+        }
+
+        for _, person_key, _ in people:
+            person_hands = hands_by_person[person_key]
+            heart_detected = self.heart_gesture(person_hands)
+            heart_position = None
+            if heart_detected:
+                left, right = sorted(
+                    person_hands[:2],
+                    key=lambda hand: hand[0].x,
+                )
+                heart_position = (
+                    int(
+                        (left[4].x + right[4].x + left[8].x + right[8].x)
+                        * frame_width
+                        / 4
+                    ),
+                    int(
+                        (left[4].y + right[4].y + left[8].y + right[8].y)
+                        * frame_height
+                        / 4
+                    ),
+                )
+
+            peace_hand = next(
+                (hand for hand in person_hands if self.peace_gesture(hand)),
+                None,
+            )
+            peace_detected = peace_hand is not None
+            peace_position = None
+            if peace_hand is not None:
+                peace_position = (
+                    int((peace_hand[8].x + peace_hand[12].x) * frame_width / 2),
+                    int((peace_hand[8].y + peace_hand[12].y) * frame_height / 2),
+                )
+
+            for name, image, detected, position in (
+                ('heart', self.heart_image, heart_detected, heart_position),
+                ('peace', self.peace_image, peace_detected, peace_position),
+            ):
+                state_key = person_key, name
+                active, started, display_position = self.gesture_states.get(
+                    state_key, (False, None, None)
+                )
+                if detected:
+                    if not active:
+                        started = time.monotonic()
+                    display_position = position
+                active = detected
+
+                if started is not None:
+                    started = self._draw_gesture_overlay(
+                        annotated_frame,
+                        image,
+                        display_position,
+                        started,
+                    )
+                    if started is None:
+                        display_position = None
+
+                if not active and started is None:
+                    self.gesture_states.pop(state_key, None)
+                else:
+                    self.gesture_states[state_key] = (
+                        active,
+                        started,
+                        display_position,
+                    )
 
         current_keys = {detection[0] for detection in detections}
         self.track_states = {
