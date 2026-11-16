@@ -9,12 +9,18 @@ from ultralytics import YOLO
 from values import (
     BOX_COLORS,
     BOX_THICKNESS,
+    FACE_DETECTOR_MODEL_FILE,
+    FEMALE_LABEL,
+    GENDER_CLASSIFIER_MODEL_FILE,
+    GENDER_MIN_CONFIDENCE,
+    GENDER_RECHECK_INTERVAL,
     HAND_LANDMARKER_MODEL_FILE,
     HEART_DISPLAY_DURATION,
     HEART_FADE_DURATION,
     HEART_IMAGE_FILE,
     HEART_OVERLAY_SIZE,
     MAX_GESTURE_PEOPLE,
+    MALE_LABEL,
     PEACE_IMAGE_FILE,
     PERSON_LABEL,
     PERSON_LABEL_FONT_SCALE,
@@ -37,6 +43,20 @@ class PersonTracker:
                 f'MediaPipe hand model not found: {hand}.'
             )
         self.model = YOLO(YOLO_MODEL_FILE)
+        gender_model = Path(__file__).with_name(GENDER_CLASSIFIER_MODEL_FILE)
+        if not gender_model.is_file():
+            raise FileNotFoundError(
+                f'Gender classifier model not found: {gender_model}'
+            )
+        self.gender_model = YOLO(str(gender_model))
+        face_model = Path(__file__).with_name(FACE_DETECTOR_MODEL_FILE)
+        if not face_model.is_file():
+            raise FileNotFoundError(
+                f'Face detector model not found: {face_model}'
+            )
+        self.face_detector = cv.CascadeClassifier(str(face_model))
+        if self.face_detector.empty():
+            raise RuntimeError(f'Could not load face detector model: {face_model}')
         options = vision.HandLandmarkerOptions(
             base_options=python.BaseOptions(model_asset_path=str(hand)),
             running_mode=vision.RunningMode.VIDEO,
@@ -47,6 +67,7 @@ class PersonTracker:
         self.track_states = {}
         self.frame_number = 0
         self.gesture_states = {}
+        self.gender_labels = {}
 
         images = Path(__file__).parent / 'images'
         heart_image = images / HEART_IMAGE_FILE
@@ -119,6 +140,83 @@ class PersonTracker:
         cv.addWeighted(overlay, alpha, region, 1 - alpha, 0, region)
         return display_started
 
+    def _classify_gender(self, frame, bounds):
+        x1, y1, x2, y2 = bounds
+        person_crop = frame[y1:y2, x1:x2]
+        if person_crop.size == 0:
+            return None
+
+        gray_crop = cv.cvtColor(person_crop, cv.COLOR_BGR2GRAY)
+        faces = self.face_detector.detectMultiScale(
+            gray_crop,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(30, 30),
+        )
+        if len(faces) == 0:
+            return None
+
+        face_x, face_y, face_width, face_height = max(
+            faces, key=lambda face: face[2] * face[3]
+        )
+        face_crop = person_crop[
+            face_y:face_y + face_height,
+            face_x:face_x + face_width,
+        ]
+        prediction = self.gender_model.predict(
+            face_crop, imgsz=224, verbose=False
+        )[0]
+        if prediction.probs.top1conf.item() < GENDER_MIN_CONFIDENCE:
+            return None
+
+        gender = prediction.names[prediction.probs.top1].lower()
+        return {'male': MALE_LABEL, 'female': FEMALE_LABEL}.get(gender)
+
+    def _update_gender_labels(self, frame, people):
+        current_person_keys = {person[1] for person in people}
+        self.gender_labels = {
+            key: state
+            for key, state in self.gender_labels.items()
+            if self.frame_number - state[2] <= TRACK_STATE_MAX_AGE
+        }
+
+        for _, person_key, bounds in people:
+            cached = self.gender_labels.get(person_key)
+            if cached is None:
+                match = max(
+                    (
+                        (self.box_iou(bounds, state[3]), key, state)
+                        for key, state in self.gender_labels.items()
+                        if key not in current_person_keys
+                        and key[0] == person_key[0]
+                    ),
+                    key=lambda candidate: candidate[0],
+                    default=None,
+                )
+                if match is not None and match[0] > TRACK_COLOR_REUSE_IOU:
+                    _, previous_key, cached = match
+                    del self.gender_labels[previous_key]
+
+            if cached is None:
+                label = None
+                last_checked = self.frame_number - GENDER_RECHECK_INTERVAL
+            else:
+                label, last_checked = cached[:2]
+
+            if (
+                label is None
+                and self.frame_number - last_checked >= GENDER_RECHECK_INTERVAL
+            ):
+                label = self._classify_gender(frame, bounds)
+                last_checked = self.frame_number
+
+            self.gender_labels[person_key] = (
+                label,
+                last_checked,
+                self.frame_number,
+                bounds,
+            )
+
     @staticmethod
     def box_iou(first, second):
         x1 = max(first[0], second[0])
@@ -166,6 +264,7 @@ class PersonTracker:
         people = person_candidates[:MAX_GESTURE_PEOPLE]
         annotated_frame = frame.copy()
         self.frame_number += 1
+        self._update_gender_labels(frame, people)
 
         rgb_frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
         mp_frame = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
@@ -310,9 +409,9 @@ class PersonTracker:
                 bounds, color, self.frame_number, hits, confirmed
             )
             if confirmed:
-                visible_detections.append((class_id, bounds, color))
+                visible_detections.append((color_key, class_id, bounds, color))
 
-        for class_id, (x1, y1, x2, y2), color in visible_detections:
+        for color_key, class_id, (x1, y1, x2, y2), color in visible_detections:
             cv.rectangle(
                 annotated_frame,
                 (x1, y1),
@@ -322,9 +421,10 @@ class PersonTracker:
             )
 
             if class_id == 0:
+                label = self.gender_labels.get(color_key, (None,))[0] or PERSON_LABEL
                 font = cv.FONT_HERSHEY_SIMPLEX
                 (text_width, text_height), baseline = cv.getTextSize(
-                    PERSON_LABEL, font, PERSON_LABEL_FONT_SCALE, PERSON_LABEL_THICKNESS
+                    label, font, PERSON_LABEL_FONT_SCALE, PERSON_LABEL_THICKNESS
                 )
                 label_width = text_width + PERSON_LABEL_PADDING * 2
                 label_height = text_height + baseline + PERSON_LABEL_PADDING * 2
@@ -341,7 +441,7 @@ class PersonTracker:
                 )
                 cv.putText(
                     annotated_frame,
-                    PERSON_LABEL,
+                    label,
                     (
                         label_x + PERSON_LABEL_PADDING,
                         label_y + PERSON_LABEL_PADDING + text_height,
