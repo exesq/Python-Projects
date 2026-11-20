@@ -27,6 +27,8 @@ from values import (
     PERSON_LABEL_PADDING,
     PERSON_LABEL_TEXT_COLOR,
     PERSON_LABEL_THICKNESS,
+    ROCK_AND_ROLL_IMAGE_FILE,
+    SHAKA_IMAGE_FILE,
     TRACK_COLOR_REUSE_IOU,
     TRACK_STATE_MAX_AGE,
     YOLO_CONFIDENCE,
@@ -82,6 +84,18 @@ class PersonTracker:
         if self.peace_image is None:
             raise FileNotFoundError(f'Could not load peace image: {peace_image}')
 
+        rock_and_roll_image = images / ROCK_AND_ROLL_IMAGE_FILE
+        self.rock_and_roll_image = cv.imread(str(rock_and_roll_image), cv.IMREAD_COLOR)
+        if self.rock_and_roll_image is None:
+            raise FileNotFoundError(
+                f'Could not load rock and roll image: {rock_and_roll_image}'
+            )
+
+        surf_boy_image = images / SHAKA_IMAGE_FILE
+        self.surf_boy_image = cv.imread(str(surf_boy_image), cv.IMREAD_COLOR)
+        if self.surf_boy_image is None:
+            raise FileNotFoundError(f'Could not load surf boy image: {surf_boy_image}')
+
     @staticmethod
     def heart_gesture(hands):
         if len(hands) < 2:
@@ -117,6 +131,34 @@ class PersonTracker:
             and hand[8].y < hand[6].y
             and hand[16].y > hand[14].y
             and hand[20].y > hand[18].y
+        )
+
+    @staticmethod
+    def rock_and_roll_gesture(hand):
+        if len(hand) < 21:
+            return False
+
+        return (
+            hand[8].y < hand[6].y
+            and hand[12].y > hand[10].y
+            and hand[16].y > hand[14].y
+            and hand[20].y < hand[18].y
+        )
+
+    @staticmethod
+    def shaka_gesture(hand):
+        if len(hand) < 21:
+            return False
+
+        hand_size = math.hypot(hand[9].x - hand[0].x, hand[9].y - hand[0].y)
+        thumb_spread = math.hypot(hand[4].x - hand[5].x, hand[4].y - hand[5].y)
+        return (
+            hand_size > 0
+            and thumb_spread > hand_size * 0.5
+            and hand[8].y > hand[6].y
+            and hand[12].y > hand[10].y
+            and hand[16].y > hand[14].y
+            and hand[20].y < hand[18].y
         )
 
     @staticmethod
@@ -330,9 +372,46 @@ class PersonTracker:
                     int((peace_hand[8].y + peace_hand[12].y) * frame_height / 2),
                 )
 
+            rock_and_roll_hand = next(
+                (hand for hand in person_hands if self.rock_and_roll_gesture(hand)),
+                None,
+            )
+            rock_and_roll_position = None
+            if rock_and_roll_hand is not None:
+                rock_and_roll_position = (
+                    int(
+                        (rock_and_roll_hand[8].x + rock_and_roll_hand[20].x)
+                        * frame_width
+                        / 2
+                    ),
+                    int(
+                        (rock_and_roll_hand[8].y + rock_and_roll_hand[20].y)
+                        * frame_height
+                        / 2
+                    ),
+                )
+
+            shaka_hand = next(
+                (hand for hand in person_hands if self.shaka_gesture(hand)),
+                None,
+            )
+            shaka_position = None
+            if shaka_hand is not None:
+                shaka_position = (
+                    int((shaka_hand[4].x + shaka_hand[20].x) * frame_width / 2),
+                    int((shaka_hand[4].y + shaka_hand[20].y) * frame_height / 2),
+                )
+
             for name, image, detected, position in (
                 ('heart', self.heart_image, heart_detected, heart_position),
                 ('peace', self.peace_image, peace_detected, peace_position),
+                (
+                    'rock_and_roll',
+                    self.rock_and_roll_image,
+                    rock_and_roll_hand is not None,
+                    rock_and_roll_position,
+                ),
+                ('shaka', self.surf_boy_image, shaka_hand is not None, shaka_position),
             ):
                 state_key = person_key, name
                 active, started, display_position = self.gesture_states.get(
