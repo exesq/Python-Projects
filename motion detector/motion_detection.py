@@ -1,6 +1,7 @@
 import math
 import time
 from pathlib import Path
+
 import cv2 as cv
 import mediapipe as mp
 from mediapipe.tasks import python
@@ -14,13 +15,14 @@ from values import (
     GENDER_CLASSIFIER_MODEL_FILE,
     GENDER_MIN_CONFIDENCE,
     GENDER_RECHECK_INTERVAL,
+    GESTURE_CONFIRMATION_FRAMES,
+    GESTURE_OVERLAY_SIZE,
     HAND_LANDMARKER_MODEL_FILE,
     HEART_DISPLAY_DURATION,
     HEART_FADE_DURATION,
     HEART_IMAGE_FILE,
-    HEART_OVERLAY_SIZE,
-    MAX_GESTURE_PEOPLE,
     MALE_LABEL,
+    MAX_GESTURE_PEOPLE,
     PEACE_IMAGE_FILE,
     PERSON_LABEL,
     PERSON_LABEL_FONT_SCALE,
@@ -37,6 +39,7 @@ from values import (
     YOLO_MODEL_FILE,
 )
 
+
 class PersonTracker:
     def __init__(self):
         hand = Path(__file__).with_name(HAND_LANDMARKER_MODEL_FILE)
@@ -44,7 +47,7 @@ class PersonTracker:
             raise FileNotFoundError(
                 f'MediaPipe hand model not found: {hand}.'
             )
-        self.model = YOLO(YOLO_MODEL_FILE)
+        self.model = YOLO(str(Path(__file__).with_name(YOLO_MODEL_FILE)))
         gender_model = Path(__file__).with_name(GENDER_CLASSIFIER_MODEL_FILE)
         if not gender_model.is_file():
             raise FileNotFoundError(
@@ -69,6 +72,7 @@ class PersonTracker:
         self.track_states = {}
         self.frame_number = 0
         self.gesture_states = {}
+        self.gesture_confirmation_frames = {}
         self.gender_labels = {}
 
         images = Path(__file__).parent / 'images'
@@ -162,6 +166,37 @@ class PersonTracker:
         )
 
     @staticmethod
+    def _gesture_confirmation_count(detected, previous_count):
+        return (
+            min(previous_count + 1, GESTURE_CONFIRMATION_FRAMES)
+            if detected
+            else 0
+        )
+
+    @staticmethod
+    def _person_for_hand(hand, people, frame_width, frame_height):
+        palm_x = (hand[0].x + hand[9].x) * frame_width / 2
+        palm_y = (hand[0].y + hand[9].y) * frame_height / 2
+        matches = []
+        for _, person_key, (x1, y1, x2, y2) in people:
+            person_height = y2 - y1
+            if person_height <= 0:
+                continue
+
+            distance_x = max(x1 - palm_x, 0, palm_x - x2)
+            distance_y = max(y1 - palm_y, 0, palm_y - y2)
+            distance = math.hypot(distance_x, distance_y)
+            if distance <= person_height * 0.5:
+                matches.append(
+                    (
+                        distance / person_height,
+                        (x2 - x1) * person_height,
+                        person_key,
+                    )
+                )
+        return min(matches)[2] if matches else None
+
+    @staticmethod
     def _draw_gesture_overlay(frame, image, position, display_started):
         if display_started is None or position is None:
             return display_started
@@ -170,7 +205,7 @@ class PersonTracker:
         if elapsed >= HEART_DISPLAY_DURATION:
             return None
 
-        overlay_size = min(HEART_OVERLAY_SIZE, frame.shape[1], frame.shape[0])
+        overlay_size = min(GESTURE_OVERLAY_SIZE, frame.shape[1], frame.shape[0])
         overlay = cv.resize(
             image, (overlay_size, overlay_size), interpolation=cv.INTER_AREA
         )
@@ -320,21 +355,21 @@ class PersonTracker:
             if len(hand) < 21:
                 continue
 
-            palm_x = (hand[0].x + hand[9].x) * frame_width / 2
-            palm_y = (hand[0].y + hand[9].y) * frame_height / 2
-            matches = []
-            for _, person_key, (x1, y1, x2, y2) in people:
-                if x1 <= palm_x <= x2 and y1 <= palm_y <= y2:
-                    area = (x2 - x1) * (y2 - y1)
-                    matches.append((area, person_key))
-            if matches:
-                _, person_key = min(matches)
+            person_key = self._person_for_hand(
+                hand, people, frame_width, frame_height
+            )
+            if person_key is not None:
                 hands_by_person[person_key].append(hand)
 
         current_person_keys = set(hands_by_person)
         self.gesture_states = {
             key: state
             for key, state in self.gesture_states.items()
+            if key[0] in current_person_keys
+        }
+        self.gesture_confirmation_frames = {
+            key: count
+            for key, count in self.gesture_confirmation_frames.items()
             if key[0] in current_person_keys
         }
 
@@ -417,11 +452,21 @@ class PersonTracker:
                 active, started, display_position = self.gesture_states.get(
                     state_key, (False, None, None)
                 )
-                if detected:
+                confirmation_frames = self._gesture_confirmation_count(
+                    detected,
+                    self.gesture_confirmation_frames.get(state_key, 0),
+                )
+                if confirmation_frames:
+                    self.gesture_confirmation_frames[state_key] = confirmation_frames
+                else:
+                    self.gesture_confirmation_frames.pop(state_key, None)
+
+                confirmed = confirmation_frames >= GESTURE_CONFIRMATION_FRAMES
+                if confirmed:
                     if not active:
                         started = time.monotonic()
                     display_position = position
-                active = detected
+                active = confirmed
 
                 if started is not None:
                     started = self._draw_gesture_overlay(
